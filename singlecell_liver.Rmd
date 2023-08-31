@@ -1,0 +1,402 @@
+---
+title: "scRNA-sequencing analysis of human liver"
+author: "Eleonora Cianini"
+date: '`r Sys.Date()`'
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+---
+
+
+```{r setup, include=FALSE}
+library(knitr)
+
+## Global options
+options(max.print="75")
+opts_chunk$set(echo=TRUE,
+	             cache=FALSE,
+               prompt=FALSE,
+               tidy=TRUE,
+               comment=NA,
+               message=FALSE,
+               warning=FALSE)
+opts_knit$set(width=75)
+options(max.print=10000)
+```
+
+
+```{r, wd, echo=FALSE}
+setwd("C:/Users/eleon/OneDrive/Documenti")
+```
+# Introduction 
+
+In the following scRNA-Seq analysis a dataset of human parenchymal and non-parenchymal liver cells has been examined.
+The dataset is available on ([PanglaoDB](https://panglaodb.se/view_data.php?sra=SRA716608&srs=SRS3391632)) and it contains 6,158 cells sequenced on the Illumina HiSeq 2500 following the 10x chromium protocol.
+
+For a better comprehension and interpretation of the analysis result, the article "*Single cell RNA sequencing of human liver reveals distinct intrahepatic macrophage populations*" (MacParland SA, Liu JC, Ma XZ, et al.2018 ) was used as reference.
+
+Most of the steps of this analysis follow the workflow of the [Seurat vignette](https://satijalab.org/seurat/articles/pbmc3k_tutorial.html) using on the `Seurat` package.
+
+
+## Download and package installation
+The following packages are those used for subsequent analysis
+```{r, libraries}
+library(Seurat) #toolkit for single cell RNA sequencing data.
+library(dplyr) 
+library(patchwork) #complex/multiple plots package
+library(ggplot2)
+library(tidyverse)
+library(umap) #package to perform Uniform Manifold Approximation and Projection.
+```
+
+
+# Data loading and Seurat Object setup
+The PanglaoDB Rdata file is loaded in R by keeping only the gene symbols as row names:
+
+```{r}
+load("SRA716608_SRS3391632.sparse.RData")
+
+rownames(sm) <- gsub("_ENS.*", "", rownames(sm))
+```
+
+The count matrix is used to create a Seurat object by performing a filter on the original table keeping only genes expressed in at least 3 cells and discarding a priori cells with less 200 genes expressed.
+The pre-processing is done in order to to exclude empty droplets or droplets containing a low-quality cell.
+
+```{r}
+#seurat object
+
+liver <- CreateSeuratObject(counts = sm, project = "liver", min.cells = 3, min.features = 200)
+
+liver
+```
+
+Almost 3,400 cells have been discarded using the filtering parameters of the Seurat vignette.
+
+
+# QC and filtering cells for further analysis 
+
+Once created the Seurat object, to be sure to work with good data, other quality controls need to be done on cells:
+
+* The number of unique genes detected in each cell;
+
+* The total number of molecules detected within a cell (strongly correlated with unique genes)
+
+* The percentage of reads that map to the mitochondrial genome.
+
+The first and the second point are done in order to not have, on one hand, low-quality cells/ empty droplets (i.e. cells expressing very few expressed genes) and, on the other hand doublets/multiplets cells (i.e. cells having an aberrant gene count).
+
+The third point is crucial because low-quality / dying cells often exhibit extensive mitochondrial contamination which need to be filtered out.
+
+Seurat automatically creates two metrics that can be used for quality filtering:
+
+* `nFeature_RNA`
+
+* `nCount_RNA`
+
+Instead, the percentage of mitochondrial reads needs to be computed "by hand", by the use of the PercentageFeatureSet() function (it calculates the percentage of counts originating from a set of feature), and subsequently added to the object.
+
+As a set of mitochondrial genes all those starting with MT- are used.
+
+```{r, mitochondrial percentage}
+# amount of MT genes
+liver[["percent.mt"]] <- PercentageFeatureSet(liver, pattern = "^MT-") 
+head(liver@meta.data, 10)  
+
+```
+
+Once calculated, the metadata are also stored in `qc.metrics` in order to be easily accessible by the conventional R plotting system (instead of using them only with the Seurat's built in plots).
+
+```{r}
+# create an object to use the feature in the R conventional plotting systems
+
+as_tibble(
+  liver[[c("nCount_RNA","nFeature_RNA","percent.mt")]],
+  rownames="Cell.Barcode"
+) -> qc.metrics
+
+```
+
+To establish which parameters should to be set for the doublets/empty drops/low quality cell removal, the violin plots of the `nfeature_RNA`, the `ncount_RNA` and the `percent_mt` are used.
+
+```{r, violins, fig.height=8, fig.width=15}
+
+VlnPlot(liver, 
+        features = c("nFeature_RNA", "nCount_RNA","percent.mt"), 
+        ncol = 3, pt.size=0, col= "skyblue2")
+
+```
+
+By observing the first two plots seems is reasonable to remove a number of unique genes expressed lower than 200 or higher than 2800.
+
+The third violin plot about the percentage of mitochondrial genes is not very informative: there are no strong evidence(i.e. the presence of a "median value") in the plot to set a threshold.
+To solve this issue the same threshold value used in the article based on the same dataset,has been selected. (i.e. 50%)
+
+```{r, plot, fig.height=8, fig.width=15 }
+#  distribution of the mitochondrion percentage across the cells with the chosen threshold
+qc.metrics %>%
+  ggplot(aes(percent.mt)) + 
+  geom_histogram(binwidth = 0.5, fill="skyblue2", colour="black") +
+  ggtitle("Distribution of Percentage Mitochondrion") +
+  geom_vline(xintercept = 50, col = "red")+
+  theme_minimal()
+
+```
+After the QC metrics visualization, we assumed to filter out cells that: 
+
+* have unique feature counts over 2800 or less than 200;
+
+* have >50% mitochondrial counts.
+
+
+Before applying the filter, since QC metrics are often related between each other, we investigated their relationship using scatter plots in which are displayed also the previous selected thresholds.
+
+```{r, filering-plots,fig.show="hold", fig.height=8}
+
+plot1 <- FeatureScatter(liver, feature1 = "nCount_RNA", feature2 = "percent.mt",
+                        cols = "skyblue2") + 
+  geom_hline(yintercept=50, colour="red")
+
+plot2 <- FeatureScatter(liver, feature1 = "nCount_RNA", feature2="nFeature_RNA",
+                        cols = "skyblue2") +  
+  geom_hline(yintercept=2800, colour="red") +
+  geom_hline(yintercept=200, colour="red")
+
+plot1 + plot2
+
+```
+
+The plots showed a negative correlation between the `percent_mt` and `nCount_RNA`, whereas there is a positive correlation between `nCount_RNA` and `nFeature_RNA`.
+
+The thresholds, individuated in the previous steps, seem to "catch" the right amount of data and so they have been applied to data in order to actually remove not needed cells.
+
+```{r}
+liver <- subset(liver, subset = nFeature_RNA > 200 & nFeature_RNA < 2800 & percent.mt < 50)
+liver
+
+```
+
+# Normalizing the data
+
+After removing unwanted cells from the dataset, the next step is to normalize the data. The default parameters for this particular type of normalization produce a log(read per ten thousands) result.
+
+```{r, normalization}
+liver <- NormalizeData(liver)
+```
+
+# Feature selection
+
+Most of the genes are not informative enough, so we want to find only the most variable ones that exhibit the highest cell-to-cell variation in the dataset.
+
+The default parameters (i.e. keep the 2000  most informative genese) are kept for all downstream analyses.
+
+```{r, feature selection}
+liver <- FindVariableFeatures(liver, selection.method = "vst", nfeatures = 2000)
+top10 <- head(VariableFeatures(liver), 10)
+
+paste("The top 10 variable genes are:", paste(top10, collapse = ", "))
+```
+The 2000 most informative features are shown in red in the following plot whereas the top 10 variable ones are labeled with their corresponding gene symbol.
+
+```{r, warning=FALSE}
+
+plot <- VariableFeaturePlot(liver)
+LabelPoints(plot = plot, points = top10, repel = TRUE, xnudge = 0, ynudge = 0)
+
+```
+# Scaling the data
+
+The scaling process is necessary for the following steps and it is made using the log-normalized counts that are processed in order to have: 
+
+* mean equal to 0;
+
+* variance equal to 1 across all cells.
+
+It corresponds to a sort of "ternarization", where, in general, for each cell a gene can be considered as up-regulated (>0), down-regulated (<0) or with average expression (=0). 
+
+```{r, cache=TRUE}
+liver <- ScaleData(liver, features = rownames(liver))
+```
+
+## Cell phase prediction
+
+Genes characterizing both the S the G2M phase of the cell cycle (stored in `cc.genes`), can cause problem in processing the cells, meaning that, from a trascriptional point of view, two cells can appear very different just because they are in a different stage of the cellular cycle.
+To avoid that issue, during the scaling procedure, is possible to "regress out" the cell cycle genes in order to remove unwanted variability generated by their presence (which may lead to biased the results).
+
+To do that, firstly each cell is assigned to its predicted cell cycle phase and, secondly the cells are displayed in a 2 dimensional space, using PCA as dimensionality reduction, to evaluate if they cluster on the basis of the predicted cell cycle.
+
+
+```{r}
+
+# Split the lists
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+
+liver <- CellCycleScoring(liver, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+# some genes are not present because are already been filtered out
+## now we have the prediction of the cell cycle phase in which is a specific cell is.
+
+# Linear dimensionality reduction with PCA
+liver <- RunPCA(liver, features = VariableFeatures(object = liver))
+
+# Visualization in a lower dimensionality space
+DimPlot(liver, reduction = "pca")
+
+```
+
+From the plot we can see that cell do not cluster according to cell cycle phase meaning that the cell cycle does not seems to be a factor for grouping cells together.
+
+Also plotting different PCs (not shown) the situation does not change, so, in that case it is not necessary to regress out cell cycle.
+
+# Dimensionality determination
+
+In this step the number of principal components (dimensions) needs to be chosen to perform the subsequent clustering analysis.
+To establish which is the minimum number of PC that allows to describe the data variability as completely as possible, we used the "elbow" plot which ranks the principal component on the basis of their explained percentage of variance.
+
+```{r}
+ElbowPlot(liver, ndims = 50)
+```
+
+By looking at the plot the range between 15 and 25 seems to be the point where the plateau starts.
+
+# UMAP Clustering
+
+Since PCA is not the best way to display sc data in a comprehensible way, to visualize clusters the Uniform Manifold Approximation and Projection (UMAP) is chosen.
+It represent cells as points in a 2D space, trying to find a low-dimensional representation that preserves relationships between neighbors in high-dimensional space.
+
+Although the "elbow" plot has shown that the "right" number of PCs that have to be chosen is around 20, in the following step we use the same clustering parameters of the Seurat's vignette (i.e. PC = 10 and resolution = 0.5) in order to see how many clusters we find.
+
+```{r, message=FALSE, cache=TRUE}
+# clustering using the default parameters
+liver_10 <- FindNeighbors(liver, dims = 1:10)
+liver_10 <- FindClusters(liver_10, resolution = 0.5)
+```
+```{r, cache=TRUE}
+#umap for 10 PC and a resolution of 0,5
+liver_10 <- RunUMAP(liver_10, dims = 1:10)
+DimPlot(liver_10, reduction = "umap", label = TRUE)
+
+```
+
+
+The clusters are pretty well designed, but we tried to improve the number of clusters by tuning the parameters of PC and resolution.
+
+In order to improve the UMAP clustering, using the elbow plot as reference, both different numbers of PCs (10, 15, 17, 18, 20, 21, 25, 30) and resolution values (0.5, 0.8, 1.2) have been tested.
+
+The "best" result was obtained by choosing 18 as number of PC and 0.5 as resolution value.
+
+It is been seen that:
+
+* increasing or decreasing the number of PCs did not have a great impact in the number of clusters;
+
+* increasing the resolution value(starting from 0.5 and up to 1.2) increased the number of clusters (up to a maximum value of 16) but, at the same time, this procedure did not identify new clusters (i.e. different/new cell types) it just split out into different clusters the same cell types, so a value of 0.5 was taken.
+
+```{r, message=FALSE, cache=TRUE}
+liver <- FindNeighbors(liver, dims = 1:18)
+liver <- FindClusters(liver, resolution = 0.5)
+
+
+```
+```{r, cache=TRUE}
+#umap for 20 PC and a resolution of 0,5
+liver <- RunUMAP(liver, dims = 1:18)
+DimPlot(liver, reduction = "umap", label = TRUE)
+
+```
+
+Using a number of PCs equal to 18 and a resolution of 0.5, 14 clusters have been found in the dataset.
+
+
+# Cluster markers
+
+Through differential expression analysis, it's possible to identify the top genes that best define each cluster.
+In this analysis the 10 top genes, for each cluster,  have been taken into account for the cell type assignment. 
+
+```{r, cache=TRUE}
+liver.markers <- FindAllMarkers(liver, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+
+cluster_genes <- liver.markers %>%
+    group_by(cluster) %>%
+    top_n(n = 10, wt = avg_log2FC)
+cluster_genes
+
+```
+Our aim is to visualize a specific marker gene for each cluster, in such a way that we could identify which cell type is that specific cluster.
+
+In order to to that we used both violin plots and two types of heatmap (useful to visually see how much a gene is expressed in each cluster).
+
+## Violin plots
+
+```{r,  fig.height=15}
+VlnPlot(liver, features = c("CD3D", "XCL2", "C1QC", "FCN1", "DNASE1L3", "HPD", "HPX", "CD5L", "MYOM2", "BIRC5", "SPARCL1", "JCHAIN", "AHSP", "TNFRSF13C"), pt.size = 0, ncol = 2)
+
+```
+From the plots it is possible to see that some markers are expressed by one clusters, whereas other are expressed by multiple clusters.
+In the second case to identify the cluster cell type, a cross-check between the references (i.e. PanglaoDB, scientific literature) has to be done.
+
+
+## Feature heatmaps
+
+The heatmaps allows for easy exploration of the primary sources heterogeneity in the dataset; they can be useful to see the expressions of all the genes across all the clusters.
+
+
+```{r, fig.height=15 }
+
+liver.markers %>%
+    group_by(cluster) %>%
+    top_n(n = 10, wt = avg_log2FC) -> top10
+
+DoHeatmap(liver, features = top10$gene) + NoLegend()
+
+```
+
+
+The map below represents the spatial localization of each marker inside the clusters.
+
+```{r, fig.height=15}
+FeaturePlot(liver, features = c("CD3D", "XCL2", "C1QC", "FCN1", "DNASE1L3", "HPD", "HPX", "CD5L", "MYOM2", "BIRC5", "SPARCL1", "JCHAIN", "AHSP", "TNFRSF13C"), ncol = 2)
+```
+
+# Cell type assignment
+
+Once founded the most expressed genes, simultaneously searching in [PanglaoDB search](https://panglaodb.se/search.html) and using the article/literature, a cell type is assigned to each of the clusters.
+The result of this analysis are shown in the following plot:
+
+```{r}
+clusters <- c("T-cells", "NK-cells", 
+              rep("Inflammatory Macs ",2), "Central venous LSECs",
+              rep("Hepatocytes", 2),"Non-inflammatory Macs",
+              "gamma-delta T cells (1)",
+              "gamma-delta T cells (2)", 
+              "Periportal LSECs", 
+              "Plasma cell", "Erythroid like", "B-cells naive")
+
+
+names(clusters) <- levels(liver)
+
+liver <- RenameIdents(liver, clusters)
+
+DimPlot(liver, reduction="umap",label=TRUE, pt.size=0.5) + NoLegend()
+
+```
+
+From this last plot is possible to see that the different population are well clustered in a way similar to both PanglaoDB and the article used as reference.
+However, not all the cell types have been found (i.e most of the hepatocytes are missing), this might be explained by the fact that data have been processed out using "personal" filters/thresholds different from the "default" ones and this may have altered the finding of the cell types.
+
+
+```{r, include=FALSE}
+table(liver_10@meta.data$seurat_clusters)
+```
+
+
+```{r, include=FALSE}
+table(liver@meta.data$seurat_clusters)
+```
+
+```{r}
+# Session info
+print(sessionInfo(), nrow = (500))
+```
+
+
+
