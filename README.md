@@ -17,7 +17,7 @@ The project begins with loading scRNA-seq data into a Seurat object, followed by
 
 Normalization methods like "LogNormalize" are employed to mitigate technical biases. Feature selection and dimensionality reduction techniques such as principal component analysis (PCA) are used to visualize the data in lower dimensions.
 
-Clustering algorithms like Louvain and hierarchical clustering help group similar cells into clusters, which can correspond to distinct cell types, and methods to identify marker genes that define each cluster and perform differential expression analysis between clusters are used to identify genes with significant expression differences.
+Clustering algorithms like Louvain and hierarchical clustering help group similar cells into clusters (i.e.,  distinct cell types). Furhtermore, methods to identify marker genes for each cluster and differential expression analysis between clusters are used to identify genes with significant expression differences.
 
 Visualization techniques including feature plots, UMAP plots, and cluster-specific gene expression heatmaps are used for the identification of the cell subtypes.
 
